@@ -139,6 +139,7 @@ class SpecAugment(torch.nn.Module):
         frames_mask_size: int = 100,
         max_frames_mask_fraction: float = 0.15,
         p=0.9,
+        batchable: bool = False,
     ):
         """
         SpecAugment's constructor.
@@ -170,6 +171,7 @@ class SpecAugment(torch.nn.Module):
         self.frames_mask_size = frames_mask_size
         self.max_frames_mask_fraction = max_frames_mask_fraction
         self.p = p
+        self.batchable = batchable
 
     def forward(
         self,
@@ -197,6 +199,249 @@ class SpecAugment(torch.nn.Module):
         assert len(features.shape) == 3, (
             "SpecAugment only supports batches of " "single-channel feature matrices."
         )
+        if self.batchable:
+            return self._forward_batchable(features, supervision_segments)
+        return self._forward_nonbatchable(features, supervision_segments)
+
+    def _forward_batchable(
+        self,
+        features: torch.Tensor,
+        supervision_segments: Optional[torch.IntTensor] = None,
+    ) -> torch.Tensor:
+        """
+        Computes SpecAugment for a batch of feature matrices in a batchable way.
+
+        :param features: a batch of feature matrices with shape ``(B, T, F)``.
+        :param supervision_segments: an int tensor of shape ``(S, 3)``. ``S`` is the number of
+            supervision segments that exist in ``features`` -- there may be either
+            less or more than the batch size.
+            The second dimension encoder three kinds of information:
+            the sequence index of the corresponding feature matrix in `features`,
+            the start frame index, and the number of frames for each segment.
+        :return: an augmented tensor of shape ``(B, T, F)``.
+        """
+        device = features.device
+        features = features.clone()
+        B, T, F = features.size()
+        supervision_segments = self._linear_increasing_supervision_segments(
+            features, supervision_segments
+        )
+
+        features = self._batchable_time_warp(features, supervision_segments)
+        # TODO: make fequency/time masking batchable if needed in the future.
+        for sequence_idx in range(features.size(0)):
+            features[sequence_idx] = self._forward_single(
+                features[sequence_idx], warp=False, mask=True
+            )
+        return features
+
+    def _batchable_time_warp(
+        self,
+        features: torch.Tensor,
+        supervision_segments: Optional[torch.IntTensor] = None,
+    ):
+        """
+        Do time warping in a batchable way.
+
+        :param features: a batch of feature matrices with shape ``(B, T, F)``.
+        :param supervision_segments: an int tensor of shape ``(S, 3)``. ``S`` is the number of
+            supervision segments that exist in ``features`` -- there may be either
+            less or more than the batch size.
+            The second dimension encoder three kinds of information:
+            the sequence index of the corresponding feature matrix in `features`,
+            the start frame index, and the number of frames for each segment.
+        :return: an augmented tensor of shape ``(B, T, F)``.
+
+        Caution:
+            This function implements 'linear' interpolation.
+            While it's non-batchable counterpart `time_warp`
+            implements 'bicubic' imterpolation.
+        """
+        device = features.device
+        B, T, C = features.size()
+        ori_features = features.clone()
+
+        start_frames = supervision_segments[:, 1]
+        num_frames = supervision_segments[:, 2]
+        end_frames = start_frames + num_frames
+        frame_idx = torch.arange(T, device=device)
+
+        no_time_warp = (torch.rand(B) > self.p).to(device)
+        no_time_warp |= num_frames <= 2 * self.time_warp_factor + 1
+
+        def _get_unchanged_mask():
+            unchanged_mask = frame_idx.expand(B, T) < start_frames.unsqueeze(1)
+            unchanged_mask |= frame_idx.expand(B, T) >= end_frames.unsqueeze(1)
+            unchanged_mask |= no_time_warp.unsqueeze(1)
+            return unchanged_mask
+
+        unchanged_mask = _get_unchanged_mask()
+        if torch.all(unchanged_mask):
+            return features
+
+        def _get_center_and_warped():
+            factor = self.time_warp_factor
+            # See the way `center` and `warped` is used in fucntion `tiime_warp`.
+            # In this function, they have the same meaning as explained below:
+            # center: nubmer of frames(1-based) of left part before time-warp,
+            #         or the first frame(0-based) offset of right part before time-warp.
+            # warped: nubmer of frames(1-based) of left part after time-warp.
+            #         or the first frame(0-based) offset of right part after time-warp.
+            #
+            # This function is running batchable,
+            # we only focusing on one smaple in a batch in following comments.
+            # code from function `time_warp`:
+            #     center = np.random.randint(factor + 1, t - factor)
+            #     warped = np.random.randint(center - factor, center + factor + 1)
+            # So if factor=2, t=6,
+            # center's range [3, 4), i.e. only 3
+            # warped's range [1, 5]
+            # Following code will generate the same results but in a batchable way.
+
+            # Variables and their values used:
+            #                                       start frame: 0
+            #                             one-based frame index: 1  2  3  4  5  6
+            #                           zero-based frame offset: 0  1  2  3  4  5
+            #                  staring and ending factor frames: -  -        -  -
+            #                  candidate frames could be center:          ^
+            #                               valid_center_frames:          1
+            #                   center_distance_to_first_center: [1 * [0, 1)].floor() --> 0
+            #           first_center = start_frame + factor + 1:       3
+            # center = first_center + center_distance_to_satart:       3
+            #           warped = center + [-factor, factor + 1): [1, 6), i.e [1, 5]
+            valid_center_frames = num_frames - 2 * factor - 1
+
+            # Since range of torch.rand is [0, 1)
+            # So range of center_distance_to_start: [0, valid_center_frames))
+            # with previous example, elements in center_distance_to_start could be only
+            # [0, 1), i.e. only [0]
+            center_distance_to_start = (
+                valid_center_frames * torch.rand(B, device=device)
+            ).floor()
+
+            center = (start_frames + factor + 1 + center_distance_to_start).to(
+                torch.long
+            )
+            # random integers generated uniformly between low (inclusive) and high (exclusive).
+            warped_distance_to_center = torch.randint(
+                low=-factor, high=factor + 1, size=(B,), device=device
+            )
+            warped = (center + warped_distance_to_center).to(torch.long)
+
+            # If a sample is not long enough, it will not do time_warp.
+            # For this kind of sampels, set center and warped to  -1
+            # to avoid "divied by zero"
+            # when computing left_ratio_dst2src and right_ratio_dst2src
+            center[torch.where(no_time_warp)] = -1
+            warped[torch.where(no_time_warp)] = -1
+
+            return center, warped
+
+        center, warped = _get_center_and_warped()
+
+        # These ratios could be used compute floating-point source locatioin.
+        # For exapmle, if start_frame = 0,
+        # center = warped * left_ratio_dst2src.
+        left_ratio_dst2src = (
+            (center - start_frames) / (warped - start_frames)
+        ).unsqueeze(1)
+        right_ratio_dst2src = (
+            (end_frames - 1 - center) / (end_frames - 1 - warped)
+        ).unsqueeze(1)
+
+        left = batchable_linear_interpolation(
+            features,
+            left_ratio_dst2src,
+            start_frames,
+            start_frames,
+            warped,
+            keep_start_frame=True,
+        )
+        right = batchable_linear_interpolation(
+            features,
+            right_ratio_dst2src,
+            center,
+            warped,
+            end_frames,
+            keep_start_frame=False,
+        )
+
+        features = left + right
+        unchanged_mask = unchanged_mask.unsqueeze(2)
+        features *= ~(unchanged_mask)
+        features += ori_features * unchanged_mask
+        return features
+
+    @staticmethod
+    def _linear_increasing_supervision_segments(
+        features: torch.Tensor,
+        supervision_segments: Optional[torch.IntTensor] = None,
+    ) -> torch.Tensor:
+        """
+        Ensure sequence index in supervision_segments is linear increasing,
+        i.e. The map between features and supervision_segments is a 1-to-1 map.
+
+        :param features: a batch of feature matrices with shape ``(B, T, F)``.
+        :param supervision_segments: an int tensor of shape ``(S, 3)``. ``S`` is the number of
+            supervision segments that exist in ``features`` -- there may be either
+            less or more than the batch size.
+            The second dimension encoder three kinds of information:
+            the sequence index of the corresponding feature matrix in `features`,
+            the start frame index, and the number of frames for each segment.
+            If supervision_segments is None, generate one meets this requirement.
+        :return: a sorted supervision_segments which makes the map between features and
+                 supervision_segments is a 1-to-1 map.
+        """
+        device = features.device
+        B, T, F = features.size()
+        if supervision_segments is None:
+            supervision_segments = torch.stack(
+                [torch.arange(0, B), torch.zeros(B), torch.tensor([T] * B)], dim=1
+            )
+            return supervision_segments.to(device)
+
+        # s is short sequence index
+        s_value, s_index = supervision_segments[:, 0].sort()
+        # Rearrange supervision_segments in case its sequence index
+        # is not in an increasing order.
+        supervision_segments = supervision_segments[s_index]
+        # In case the map between supervision_segments and features
+        supervision_segments = supervision_segments.to(device)
+        # is not a 1-to-1 map.
+        # For example, suppervision_segments = torch.tensor([[0, 0, 100],
+        #                                                    [1, 10, 80],
+        #                                                    [5, 20, 60],
+        #                                                    [3, 30, 50],
+        #                                                    [3, 30, 40],
+        #                                                    [2, 40, 20],
+        #                                                    [4, 40, 20],
+        #                                                    ])
+        assert s_value.size(0) == B and torch.all(
+            s_value == torch.arange(B, device=device)
+        ), (
+            "Please set SpecAugment(batchable=False).\n"
+            "Current batchable version requires a 1-to-1 map"
+            " between features and supervision_segments"
+        )
+        return supervision_segments
+
+    def _forward_nonbatchable(
+        self,
+        features: torch.Tensor,
+        supervision_segments: Optional[torch.IntTensor] = None,
+    ) -> torch.Tensor:
+        """
+        Computes SpecAugment for a batch of feature matrices.
+
+        :param features: a batch of feature matrices with shape ``(B, T, F)``.
+        :param supervision_segments: an int tensor of shape ``(S, 3)``. ``S`` is the number of
+            supervision segments that exist in ``features`` -- there may be either
+            less or more than the batch size.
+            The second dimension encoder three kinds of information:
+            the sequence index of the corresponding feature matrix in `features`,
+            the start frame index, and the number of frames for each segment.
+        :return: an augmented tensor of shape ``(B, T, F)``.
+        """
         features = features.clone()
         if supervision_segments is None:
             # No supervisions - apply spec augment to full feature matrices.
@@ -340,6 +585,66 @@ def mask_along_axis_optimized(
 
     features = features.squeeze(0)
     return features
+
+
+def batchable_linear_interpolation(
+    features: torch.Tensor,
+    ratio_dst2src: torch.Tensor,
+    src_start_frames: torch.Tensor,
+    dst_start_frames: torch.Tensor,
+    dst_end_frames: torch.Tensor,
+    keep_start_frame: torch.bool,
+) -> torch.Tensor:
+    """
+    Time warping based on linear interpolation in a batchable way.
+
+    :param features: input tensor of shape ``(B, T, F)``
+    :param ratio_dst2src: length_warped / lenght_source, of shape ``(B,)``.
+    :param src_start_frames: 0-based start frames to be warped , of shape ``(B,)``.
+    :param dst_start_frames: 0-based start frames after time-warping, of shape ``(B,)``.
+        For the ``left`` part, ``dst_start_frames`` is always equal to src_start_frames.
+        For the ``right`` part, ``src_start_frames`` is ``center``,
+        while dst_start_frames is ``warped``
+    :param dst_end_frames: 0-based end frames after time-warping, of shape ``(B,)``.
+        It stores index of one-path-the-end-element.
+    :param keep_start_frame: Wheter to keep the start frames after time-warping.
+        Since then last frame of ``left`` is always overlapping with
+        the first frame of ``right`` part. When generate the ``right`` part,
+        set keep_start_frame to false, so warped_feature = left + right.
+        Or the valud of overlapped frame is double as it should be.
+    :return: a warped tensor of shape ``(B, T, F)``
+    """
+    B, T, C = features.size()
+    device = features.device
+    assert src_start_frames.shape == (B,)
+    assert dst_start_frames.shape == (B,)
+    assert dst_end_frames.shape == (B,)
+    # For broadcastable later, following variable are made with shape: [B, 1]
+    src_start_frames = src_start_frames.unsqueeze(1)
+    dst_start_frames = dst_start_frames.unsqueeze(1)
+    dst_end_frames = dst_end_frames.unsqueeze(1)
+
+    frame_idx_2d = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+    dst_frames_to_start = frame_idx_2d - dst_start_frames
+    index_float = dst_frames_to_start * ratio_dst2src + src_start_frames
+    index_1st = index_float.floor().to(torch.long).clip(0, T - 2)
+    index_2nd = index_1st + 1
+    weight_1st = index_2nd - index_float
+    weight_2nd = 1 - weight_1st
+
+    warped_features = features.gather(
+        1, index_1st.unsqueeze(2).expand(B, T, C)
+    ) * weight_1st.unsqueeze(2) + features.gather(
+        1, index_2nd.unsqueeze(2).expand(B, T, C)
+    ) * weight_2nd.unsqueeze(
+        2
+    )
+    warped_area_mask = frame_idx_2d <= dst_end_frames
+    warped_area_mask &= frame_idx_2d >= dst_start_frames
+    if not keep_start_frame:
+        warped_area_mask &= frame_idx_2d > dst_start_frames
+    warped_features *= warped_area_mask.unsqueeze(2)
+    return warped_features
 
 
 def time_warp(features: torch.Tensor, factor: int) -> torch.Tensor:
