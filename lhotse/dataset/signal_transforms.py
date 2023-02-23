@@ -140,6 +140,7 @@ class SpecAugment(torch.nn.Module):
         max_frames_mask_fraction: float = 0.15,
         p=0.9,
         batchable: bool = False,
+        avg_method: str = "fbank"
     ):
         """
         SpecAugment's constructor.
@@ -172,6 +173,8 @@ class SpecAugment(torch.nn.Module):
         self.max_frames_mask_fraction = max_frames_mask_fraction
         self.p = p
         self.batchable = batchable
+        assert avg_method in ["fbank", "fbank_exp"]
+        self.avg_method = avg_method
 
     def forward(
         self,
@@ -228,12 +231,10 @@ class SpecAugment(torch.nn.Module):
         )
 
         features = self._batchable_time_warp(features, supervision_segments)
-        # TODO: make fequency/time masking batchable if needed in the future.
-        for sequence_idx in range(features.size(0)):
-            features[sequence_idx] = self._forward_single(
-                features[sequence_idx], warp=False, mask=True
-            )
-        return features
+
+        features, mask_frequency = self.time_frequency_mask(features, axis=2)
+        features, mask_time = self.time_frequency_mask(features, axis=1)
+        return features, mask_frequency, mask_time
 
     def _batchable_time_warp(
         self,
@@ -371,6 +372,81 @@ class SpecAugment(torch.nn.Module):
         features *= ~(unchanged_mask)
         features += ori_features * unchanged_mask
         return features
+
+    def get_mask_params(self, x: Tensor , axis: int) -> Tuple[Tensor, Tensor]:
+        total_size = x.size(axis)
+        if axis == 1:
+            # time mask
+            frame_mask_size = float(self.frame_mask_size)
+            mask_size = float(self.frame_mask_size)
+            # int() rounds down
+            num_masks = int(total_size * float(self.max_frames_mask_fraction) / frame_mask_size)
+        else:
+            # frequency mask
+            mask_size = self.features_mask_size
+            num_masks = self.num_feature_masks
+        return mask_size, num_masks
+
+    def get_average(self, x: Tensor, axis:int) -> Tensor:
+        (B, T, F) = x.shape
+        # For avg_func = torch.logsumexp,
+        # imagine we had taken the average after exponentiating.  we're losing the frequency
+        # information but keeping the total volume information.
+        avg_func = torch.mean if self.avg_method == "fbank" else torch.logsumexp
+        if axis == 1:
+            # time mask
+            x_avg = avg_func(x, dim=2, keepdim=True)
+        else:
+            # frequency mask
+            x_avg = avg_func(x, dim=(1, 2), keepdim=True)
+        x_avg = x_avg.expand(B, T, F)
+
+    def time_frequency_mask(self,
+                x: Tensor,
+                axis: int,
+        ) -> Tensor:
+        # axis
+        # 1 -> time, 2 -> frequency
+        assert axis in [1, 2], \
+            f"Only Frequency and Time masking are supported"
+        mask_size, num_masks = self.get_mask_params(x, axis)
+
+        (B, T, F) = x.shape
+        # int() rounds down
+        total_size = x.size(axis)
+        if num_masks == 0:
+            if axis == 1:  # Frequency
+                return x, torch.zeros(size=(B, T, 1), dtype=torch.bool, device=x.device)
+            else:
+                return x, torch.zeros(size=(B, 1, F), dtype=torch.bool, device=x.device)
+
+        # we don't ensure the masks don't overlap.
+        mask_starts = torch.randint(low=0, high=total_size - int(mask_size),
+                                     size=(num_masks, B, 1),
+                                     device=x.device)
+        mask_widths = torch.randint(low=0, high=int(mask_size),
+                            size=(num_masks, B, 1),
+                            device=x.device)
+        mask_ends = mask_starts + mask_widths
+        linear_idx = torch.arange(0, total_size, device=x.device)  # (T,)
+        # masked: (num_masks, B, T).
+        masked_1st = torch.logical_and(linear_idx >= mask_starts, linear_idx < mask_ends)
+
+        unmasked_axis = 2 if axis == 1 else 1
+
+        # (B, T, 1) if axis=1
+        # (B, 1, F) if axis=2
+        masked = torch.any(masked_1st, dim=0).unsqueeze(unmasked_axis)
+
+        x_avg = self.get_average(x, axis=axis)
+
+        x_ori = x.clone()
+        x = torch.where(masked, x_avg, x)
+        # fraction_modified = torch.mean((x[..., 0] == x[..., 1]).to(torch.float32))
+        fraction_modified = masked.to(float).mean()
+        if random.random() < 0.01 or __name__ == "__main__":
+            logging.info("fraction_modified = ", fraction_modified)
+        return x, masked
 
     @staticmethod
     def _linear_increasing_supervision_segments(
