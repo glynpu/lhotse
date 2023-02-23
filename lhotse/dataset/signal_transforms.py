@@ -552,7 +552,6 @@ class SpecAugment(torch.nn.Module):
             if self.time_warp_factor is not None and self.time_warp_factor >= 1:
                 features = time_warp(features, factor=self.time_warp_factor)
         if mask:
-            # Mean of the whole feature matrix is used to fill frequency masking area.
             mean = features.mean()
             # Frequency masking
             features = mask_along_axis_optimized(
@@ -571,8 +570,6 @@ class SpecAugment(torch.nn.Module):
             max_mask_frames = min(
                 self.frames_mask_size, max_tot_mask_frames // num_frame_masks
             )
-            # Mean of each frame is used to fill time masking area.
-            mean = features.mean(dim=1)
             features = mask_along_axis_optimized(
                 features,
                 mask_size=max_mask_frames,
@@ -643,15 +640,11 @@ def mask_along_axis_optimized(
     mask_ends = (min_values.long() + values.long()).squeeze()
 
     if axis == 1:
-        # change mask_value.shape: [T] --> [T, 1]
-        # so it could be broadcastable to assign features later,
-        # since features is with shape [1, T, F]
-        mask_value = mask_value.unsqueeze(1)
         if mask_times == 1:
-            features[:, mask_starts:mask_ends] = mask_value[mask_starts:mask_ends]
+            features[:, mask_starts:mask_ends] = mask_value
             return features.squeeze(0)
         for (mask_start, mask_end) in zip(mask_starts, mask_ends):
-            features[:, mask_start:mask_end] = mask_value[mask_start:mask_end]
+            features[:, mask_start:mask_end] = mask_value
     else:
         if mask_times == 1:
             features[:, :, mask_starts:mask_ends] = mask_value
