@@ -5,6 +5,7 @@ from typing import Dict, Optional, Sequence, Tuple, TypeVar, Union
 
 import numpy as np
 import torch
+from torch import Tensor
 
 from lhotse import CutSet, FeatureExtractor
 from lhotse.augmentation import dereverb_wpe_torch
@@ -234,7 +235,8 @@ class SpecAugment(torch.nn.Module):
 
         features, mask_frequency = self.time_frequency_mask(features, axis=2)
         features, mask_time = self.time_frequency_mask(features, axis=1)
-        return features, mask_frequency, mask_time
+        # return torch.cat([features, mask_frequency, mask_time], dim=2)
+        return features
 
     def _batchable_time_warp(
         self,
@@ -374,13 +376,15 @@ class SpecAugment(torch.nn.Module):
         return features
 
     def get_mask_params(self, x: Tensor , axis: int) -> Tuple[Tensor, Tensor]:
+        assert axis in [1, 2], \
+            f"Only Frequency and Time masking are supported"
         total_size = x.size(axis)
         if axis == 1:
             # time mask
-            frame_mask_size = float(self.frame_mask_size)
-            mask_size = float(self.frame_mask_size)
+            frames_mask_size = float(self.frames_mask_size)
+            mask_size = float(self.frames_mask_size)
             # int() rounds down
-            num_masks = int(total_size * float(self.max_frames_mask_fraction) / frame_mask_size)
+            num_masks = int(total_size * float(self.max_frames_mask_fraction) / frames_mask_size)
         else:
             # frequency mask
             mask_size = self.features_mask_size
@@ -400,6 +404,7 @@ class SpecAugment(torch.nn.Module):
             # frequency mask
             x_avg = avg_func(x, dim=(1, 2), keepdim=True)
         x_avg = x_avg.expand(B, T, F)
+        return x_avg
 
     def time_frequency_mask(self,
                 x: Tensor,
@@ -415,10 +420,12 @@ class SpecAugment(torch.nn.Module):
         # int() rounds down
         total_size = x.size(axis)
         if num_masks == 0:
-            if axis == 1:  # Frequency
-                return x, torch.zeros(size=(B, T, 1), dtype=torch.bool, device=x.device)
-            else:
-                return x, torch.zeros(size=(B, 1, F), dtype=torch.bool, device=x.device)
+            return x, torch.zeros(size=(B, T, F), dtype=torch.bool, device=x.device)
+        # if num_masks == 0:
+        #     if axis == 1:  # Frequency
+        #         return x, torch.zeros(size=(B, T, 1), dtype=torch.bool, device=x.device)
+        #     else:
+        #         return x, torch.zeros(size=(B, 1, F), dtype=torch.bool, device=x.device)
 
         # we don't ensure the masks don't overlap.
         mask_starts = torch.randint(low=0, high=total_size - int(mask_size),
@@ -440,12 +447,10 @@ class SpecAugment(torch.nn.Module):
 
         x_avg = self.get_average(x, axis=axis)
 
-        x_ori = x.clone()
         x = torch.where(masked, x_avg, x)
         # fraction_modified = torch.mean((x[..., 0] == x[..., 1]).to(torch.float32))
         fraction_modified = masked.to(float).mean()
-        if random.random() < 0.01 or __name__ == "__main__":
-            logging.info("fraction_modified = ", fraction_modified)
+        masked = masked.expand(B, T, F)
         return x, masked
 
     @staticmethod
