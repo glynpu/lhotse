@@ -141,6 +141,7 @@ class SpecAugment(torch.nn.Module):
         max_frames_mask_fraction: float = 0.15,
         p=0.9,
         batchable: bool = False,
+        time_mask_first: bool = False,
         avg_method: str = "fbank"
     ):
         """
@@ -176,6 +177,7 @@ class SpecAugment(torch.nn.Module):
         self.batchable = batchable
         assert avg_method in ["fbank", "fbank_exp"]
         self.avg_method = avg_method
+        self.time_mask_first = time_mask_first
 
     def forward(
         self,
@@ -233,9 +235,12 @@ class SpecAugment(torch.nn.Module):
 
         features = self._batchable_time_warp(features, supervision_segments)
 
-        features, mask_frequency = self.time_frequency_mask(features, axis=2)
-        features, mask_time = self.time_frequency_mask(features, axis=1)
-        # return torch.cat([features, mask_frequency, mask_time], dim=2)
+        if self.time_mask_first:
+            features, mask_time = self.time_frequency_mask(features, axis=1)
+            features, mask_frequency = self.time_frequency_mask(features, axis=2)
+        else:
+            features, mask_frequency = self.time_frequency_mask(features, axis=2)
+            features, mask_time = self.time_frequency_mask(features, axis=1)
         return features
 
     def _batchable_time_warp(
